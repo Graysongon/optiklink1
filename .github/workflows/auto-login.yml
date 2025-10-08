@@ -1,0 +1,193 @@
+name: Auto Login with Cookie
+
+on:
+  schedule:
+    # 每天运行一次，北京时间上午9点（UTC 1:00）
+    - cron: '0 1 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up WARP
+        uses: fscarmen/warp-on-actions@v1.4
+        with:
+          stack: dual        # Optional. Support [ ipv4, ipv6, dual ]. Default is dual.
+          mode: wireguard    # Optional. Support [ wireguard, client ]. Default is wireguard.
+
+      - name: Install PyNaCl
+        run: |
+          pip install PyNaCl
+
+      - name: Login and Update Cookie
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          OLD_COOKIE: ${{ secrets.LOGIN_COOKIE }}
+        run: |
+          echo "开始登录..."
+          
+          # 创建临时文件存储 Cookie 和响应头
+          COOKIE_FILE=$(mktemp)
+          HEADER_FILE=$(mktemp)
+          
+          # 使用 curl 发送请求并保存响应头
+          response=$(curl -s -w "\n%{http_code}" -L \
+            -D "$HEADER_FILE" \
+            -c "$COOKIE_FILE" \
+            -b "$OLD_COOKIE" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8" \
+            -H "Referer: https://optiklink.com/auth" \
+            "https://optiklink.com/")
+          
+          # 分离响应体和状态码
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "HTTP 状态码: $http_code"
+          
+          # 检查是否登录成功
+          if [ "$http_code" != "200" ]; then
+            echo "❌ 登录失败，HTTP状态码: $http_code"
+            rm -f "$COOKIE_FILE"
+            exit 1
+          fi
+          
+          echo "✅ 登录成功！"
+          echo "登录时间: $(date '+%Y-%m-%d %H:%M:%S')"
+          
+          # 从响应头和 Cookie 文件中提取新的 Cookie
+          NEW_COOKIE=""
+          
+          echo "提取新的 Cookie..."
+          
+          # 方法1: 从响应头的 Set-Cookie 中提取
+          if [ -f "$HEADER_FILE" ]; then
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^[Ss]et-[Cc]ookie:\ (.+)$ ]]; then
+                cookie_value="${BASH_REMATCH[1]}"
+                # 提取 cookie 的 name=value 部分（去掉其他属性）
+                cookie_pair=$(echo "$cookie_value" | cut -d';' -f1 | tr -d '\r')
+                
+                if [ -n "$cookie_pair" ]; then
+                  if [ -n "$NEW_COOKIE" ]; then
+                    NEW_COOKIE="$NEW_COOKIE; $cookie_pair"
+                  else
+                    NEW_COOKIE="$cookie_pair"
+                  fi
+                fi
+              fi
+            done < "$HEADER_FILE"
+          fi
+          
+          # 方法2: 如果从响应头没获取到，尝试从 cookie 文件提取
+          if [ -z "$NEW_COOKIE" ] && [ -f "$COOKIE_FILE" ]; then
+            echo "尝试从 Cookie 文件提取..."
+            while read -r line; do
+              # 跳过注释行
+              if [[ "$line" =~ ^#.* ]] || [ -z "$line" ]; then
+                continue
+              fi
+              
+              # Netscape cookie 格式: domain flag path secure expiration name value
+              name=$(echo "$line" | awk '{print $6}')
+              value=$(echo "$line" | awk '{print $7}')
+              
+              if [ -n "$name" ] && [ -n "$value" ]; then
+                if [ -n "$NEW_COOKIE" ]; then
+                  NEW_COOKIE="$NEW_COOKIE; $name=$value"
+                else
+                  NEW_COOKIE="$name=$value"
+                fi
+              fi
+            done < "$COOKIE_FILE"
+          fi
+          
+          # 方法3: 如果还是没有，使用旧 Cookie
+          if [ -z "$NEW_COOKIE" ]; then
+            echo "未获取到新 Cookie，使用原有 Cookie"
+            NEW_COOKIE="$OLD_COOKIE"
+          fi
+          
+          echo "Cookie 已提取"
+          echo "Cookie 长度: ${#NEW_COOKIE}"
+          echo "Cookie 前50字符: ${NEW_COOKIE:0:50}..."
+          
+          # 如果获取到新的 Cookie，更新 GitHub Secret
+          if [ -n "$NEW_COOKIE" ] && [ ${#NEW_COOKIE} -gt 10 ]; then
+            echo "正在更新 GitHub Secret..."
+            
+            # 获取 Secret 的公钥
+            pub_key_response=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/secrets/public-key")
+            
+            key_id=$(echo "$pub_key_response" | jq -r '.key_id')
+            public_key=$(echo "$pub_key_response" | jq -r '.key')
+            
+            if [ -n "$key_id" ] && [ "$key_id" != "null" ] && [ -n "$public_key" ] && [ "$public_key" != "null" ]; then
+              # 使用 Python 加密 Secret
+              cat > /tmp/encrypt_secret.py << 'PYTHON_SCRIPT'
+          import base64
+          import sys
+          import os
+          from nacl import encoding, public
+          
+          def encrypt_secret(public_key_str, secret_value):
+              public_key_bytes = base64.b64decode(public_key_str)
+              public_key_obj = public.PublicKey(public_key_bytes)
+              sealed_box = public.SealedBox(public_key_obj)
+              encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+              return base64.b64encode(encrypted).decode("utf-8")
+          
+          if __name__ == "__main__":
+              pub_key = sys.argv[1]
+              secret = sys.argv[2]
+              try:
+                  result = encrypt_secret(pub_key, secret)
+                  print(result)
+              except Exception as e:
+                  print(f"ERROR: {e}", file=sys.stderr)
+                  sys.exit(1)
+          PYTHON_SCRIPT
+              
+              encrypted_value=$(python3 /tmp/encrypt_secret.py "$public_key" "$NEW_COOKIE")
+              
+              if [ $? -eq 0 ] && [ -n "$encrypted_value" ]; then
+                # 更新 Secret
+                update_response=$(curl -s -X PUT \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$REPO/actions/secrets/LOGIN_COOKIE" \
+                  -d "{\"encrypted_value\":\"$encrypted_value\",\"key_id\":\"$key_id\"}")
+                
+                echo "✅ Cookie 已更新到 GitHub Secrets"
+              else
+                echo "⚠️ Cookie 加密失败"
+              fi
+              
+              rm -f /tmp/encrypt_secret.py
+            else
+              echo "⚠️ 无法获取公钥，跳过 Cookie 更新"
+            fi
+          else
+            echo "⚠️ 未获取到有效的新 Cookie"
+          fi
+          
+          # 清理临时文件
+          rm -f "$COOKIE_FILE" "$HEADER_FILE"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 登录结果 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 🕐 执行时间: $(date '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 目标网站: https://optiklink.com/" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 状态: 执行完成" >> $GITHUB_STEP_SUMMARY
